@@ -3,9 +3,9 @@ import os
 from sys import argv
 from typing import Dict
 from fhir.resources.bundle import Bundle, BundleEntry
-from supabase_client import FILES, download_all_files, upload_bundle_to_fhir_server, upload_cleaned_files
+from supabase_client import FILES, download_all_files, upload_cleaned_files
 from cleaner import clean_all_dataframes
-from exporter import create_fhir_resources
+from exporter import create_fhir_resources, upload_bundle_to_fhir_server
 from mock_data_adder import process_files as add_mock_data
 from postgres_client import upload_contacts_to_postgres
 

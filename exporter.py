@@ -1,13 +1,21 @@
 import pandas as pd
 import os
 import re
+import uuid
+import requests
 from typing import Dict, List
+from dotenv import load_dotenv
 from supabase_client import FILES, download_all_files
 from fhir.resources.organization import Organization
 from fhir.resources.plandefinition import PlanDefinition
 from fhir.resources.narrative import Narrative
 from fhir.resources.reference import Reference
 from fhir.resources.domainresource import DomainResource
+from fhir.resources.contactpoint import ContactPoint
+from fhir.resources.bundle import Bundle, BundleEntry, BundleEntryRequest
+
+load_dotenv()
+FHIR_SERVER = os.environ.get("FHIR_SERVER")
 
 def sanitize_id(text: str) -> str:
     """Generate a valid FHIR ID from a string."""
@@ -50,6 +58,8 @@ def create_fhir_resources(dataframes: Dict[str, pd.DataFrame]) -> List[DomainRes
         process_col = "proces"
         desc_col = "popis_procesu"
         relation_col = "vazba_na_org_rad"
+        email_col = "email"
+        phone_col = "telephone_number"
         
         if name_col not in df.columns:
             print(f"Skipping {df_name}: Standardized column '{name_col}' not found.")
@@ -78,6 +88,14 @@ def create_fhir_resources(dataframes: Dict[str, pd.DataFrame]) -> List[DomainRes
             
             full_description_html = f"<div xmlns=\"http://www.w3.org/1999/xhtml\"><h3>{dept_name}</h3><ul>{''.join(description_parts)}</ul></div>"
             
+            # Extract contact info from the first row of the group
+            telecoms = []
+            first_row = group.iloc[0]
+            if email_col in first_row and pd.notna(first_row[email_col]):
+                telecoms.append(ContactPoint(system="email", value=str(first_row[email_col])))
+            if phone_col in first_row and pd.notna(first_row[phone_col]):
+                telecoms.append(ContactPoint(system="phone", value=str(first_row[phone_col])))
+
             # We assign a temporary ID here to allow linking (e.g. partOf).
             # The client uploader will strip this ID and replace it with a UUID for the transaction,
             # allowing the server to assign the final ID.
@@ -85,7 +103,7 @@ def create_fhir_resources(dataframes: Dict[str, pd.DataFrame]) -> List[DomainRes
                 id=org_id,
                 name=str(dept_name),
                 active=True,
-                text=Narrative(status="generated", div=full_description_html)
+                text=Narrative(status="generated", div=full_description_html),
             )
             
             # Link to parent organization if this is not the parent
@@ -138,14 +156,69 @@ def create_fhir_resources(dataframes: Dict[str, pd.DataFrame]) -> List[DomainRes
             
     return resources
 
-if __name__ == "__main__":
-    dataframes = load_dataframes()
-    print(f"Loaded {len(dataframes)} DataFrames")
-    
-    resources = create_fhir_resources(dataframes)
-    print(f"Created {len(resources)} FHIR resources")
-    
-    # Example: Print the first one
-    if resources:
-        print(resources[0].model_dump_json(indent=2))
+def upload_bundle_to_fhir_server(resources: List[DomainResource]):
+    """
+    Uploads FHIR resources to a FHIR server using a Transaction Bundle.
+    Uses POST (create) interaction with UUIDs for internal references.
+    """
+    if not FHIR_SERVER:
+        print("FHIR_SERVER environment variable not set.")
+        return
+
+    # Limit to 10 resources to avoid overloading
+    if len(resources) > 10:
+        print(f"Limiting upload to first 10 resources (out of {len(resources)}).")
+        resources = resources[:10]
+
+    base_url = f"{FHIR_SERVER}"
+
+    # Map original IDs to UUIDs for bundle references
+    id_map = {r.id: str(uuid.uuid4()) for r in resources if r.id}
+
+    entries = []
+    for resource in resources:
+        resource_type = resource.__resource_type__
+        original_id = resource.id
+        
+        if not original_id:
+            continue
+
+        # Update references for Organization.partOf
+        if isinstance(resource, Organization) and resource.partOf:
+            ref = resource.partOf.reference
+            if ref and ref.startswith("Organization/"):
+                ref_id = ref.split("/")[1]
+                if ref_id in id_map:
+                    resource.partOf.reference = f"urn:uuid:{id_map[ref_id]}"
+
+        # Remove the temporary ID so the server assigns a new one
+        resource.id = None
+
+        # Create a BundleEntry with a POST request (create)
+        request = BundleEntryRequest(method="POST", url=resource_type)
+
+        entry = BundleEntry(
+            fullUrl=f"urn:uuid:{id_map[original_id]}",
+            resource=resource,
+            request=request,
+        )
+        entries.append(entry)
+
+    # Create the Bundle
+    bundle = Bundle(type="transaction", entry=entries)
+
+    print(f"Uploading transaction bundle with {len(entries)} entries to {base_url}...")
+
+    headers = {"Content-Type": "application/fhir+json"}
+    try:
+        response = requests.post(
+            base_url, data=bundle.model_dump_json(), headers=headers
+        )
+        response.raise_for_status()
+        print("Upload successful!")
+        # print(response.json())
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to upload bundle: {e}")
+        if hasattr(e, "response") and e.response is not None:
+            print(f"Server response: {e.response.text}")
 
