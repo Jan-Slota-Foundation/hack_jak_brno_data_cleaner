@@ -1,0 +1,4 @@
+.env
+__pycache__/
+current/
+generated_resources.json
